@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { ControlInputs, VehiclePhysicsState } from '../../types/physics';
 import { VehicleDefinition } from '../../types/vehicle';
+import { collisionSystem } from './CollisionSystem';
 
 export class CarPhysics {
   private def: VehicleDefinition;
@@ -161,9 +162,15 @@ export class CarPhysics {
     state.velocity.addScaledVector(this.right, newLateralSpeed);
 
     // Ground Contact & Terrain Height
-    const carGroundHeight = 1.0;
-    state.position.y = carGroundHeight; // Stay firmly grounded on roads
+    const surface = collisionSystem.getSurfaceAt(state.position.x, state.position.z, state.position.y);
+    state.surfaceType = surface.surfaceType;
+    const carGroundHeight = surface.elevation + 0.85;
+    state.position.y = carGroundHeight; // Stay firmly grounded on roads and terrain
     state.isGrounded = true;
+
+    // Building collision prevention
+    collisionSystem.resolveBuildingCollision(state.position, state.velocity, 2.5);
+
     state.position.addScaledVector(state.velocity, dt);
 
     // Telemetry updates

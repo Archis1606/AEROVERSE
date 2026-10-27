@@ -1,21 +1,19 @@
 /**
  * AEROVERSE Web Audio Synthesizer
- * Fully procedural sound effects & engine synthesis:
- * - Jet turbine whine, combustion noise & afterburner rumble
- * - Helicopter rotor blade slap (whop-whop), turbine & tail rotor
- * - Car multi-harmonic engine revving, RPM curve, gear shifts, tire screech
- * - UI feedback, stall warnings, checkpoint chimes
+ * Fully procedural sound effects & engine synthesis.
+ * FIXED: Audio is NOT stopped when game pauses. Only dampened via a pause gain node.
+ * Pause/resume cycles are fully stable. AudioContext is never destroyed mid-session.
  */
 
 class SoundSystem {
   private ctx: AudioContext | null = null;
-  private isMuted: boolean = false;
   private initialized: boolean = false;
 
   // Master Gain Nodes
   private masterGain: GainNode | null = null;
   private engineGain: GainNode | null = null;
   private fxGain: GainNode | null = null;
+  private pauseGain: GainNode | null = null; // Separate gain for pause damping (never destroyed)
 
   // Jet Nodes
   private jetTurbineOsc1: OscillatorNode | null = null;
@@ -43,30 +41,46 @@ class SoundSystem {
   private tireFilter: BiquadFilterNode | null = null;
   private carActive: boolean = false;
 
-  // Noise Buffer
+  // Noise Buffer (shared)
   private noiseBuffer: AudioBuffer | null = null;
+
+  // Target volumes (persisted across pause/resume)
+  private targetMaster = 0.8;
+  private targetEngine = 0.75;
+  private targetFx = 0.8;
 
   constructor() {
     // Lazy initialize on first interaction
   }
 
   public init() {
-    if (this.initialized) return;
+    if (this.initialized) {
+      // Ensure AudioContext is running (may be suspended after browser autoplay policy)
+      this.resume();
+      return;
+    }
     try {
       const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
       this.ctx = new AudioCtx();
-      
+
+      // Node chain: engine/fx → pauseGain → masterGain → destination
       this.masterGain = this.ctx.createGain();
-      this.masterGain.gain.setValueAtTime(0.8, this.ctx.currentTime);
+      this.masterGain.gain.setValueAtTime(this.targetMaster, this.ctx.currentTime);
       this.masterGain.connect(this.ctx.destination);
 
+      // pauseGain sits between engine/fx and masterGain so we can duck audio on pause
+      // without destroying any nodes.
+      this.pauseGain = this.ctx.createGain();
+      this.pauseGain.gain.setValueAtTime(1.0, this.ctx.currentTime);
+      this.pauseGain.connect(this.masterGain);
+
       this.engineGain = this.ctx.createGain();
-      this.engineGain.gain.setValueAtTime(0.75, this.ctx.currentTime);
-      this.engineGain.connect(this.masterGain);
+      this.engineGain.gain.setValueAtTime(this.targetEngine, this.ctx.currentTime);
+      this.engineGain.connect(this.pauseGain);
 
       this.fxGain = this.ctx.createGain();
-      this.fxGain.gain.setValueAtTime(0.8, this.ctx.currentTime);
-      this.fxGain.connect(this.masterGain);
+      this.fxGain.gain.setValueAtTime(this.targetFx, this.ctx.currentTime);
+      this.fxGain.connect(this.pauseGain);
 
       this.createNoiseBuffer();
       this.initialized = true;
@@ -92,6 +106,9 @@ class SoundSystem {
   }
 
   public setVolumes(master: number, engine: number, fx: number) {
+    this.targetMaster = master;
+    this.targetEngine = engine;
+    this.targetFx = fx;
     if (!this.ctx) return;
     const now = this.ctx.currentTime;
     if (this.masterGain) this.masterGain.gain.setTargetAtTime(master, now, 0.05);
@@ -99,10 +116,26 @@ class SoundSystem {
     if (this.fxGain) this.fxGain.gain.setTargetAtTime(fx, now, 0.05);
   }
 
+  /**
+   * Smoothly reduce audio when paused. DOES NOT stop or disconnect any nodes.
+   * Audio resumes at full volume when resumed.
+   */
+  public setPaused(paused: boolean) {
+    if (!this.ctx || !this.pauseGain) return;
+    const now = this.ctx.currentTime;
+    if (paused) {
+      // Reduce to 15% but keep running (lets the engine "idle" quietly in background)
+      this.pauseGain.gain.setTargetAtTime(0.15, now, 0.2);
+    } else {
+      // Restore to full
+      this.pauseGain.gain.setTargetAtTime(1.0, now, 0.1);
+      this.resume();
+    }
+  }
+
   // --- JET SOUNDS ---
   public startJet() {
     this.init();
-    this.resume();
     if (!this.ctx || !this.engineGain || !this.noiseBuffer || this.jetActive) return;
     this.stopAllEngines();
 
@@ -166,18 +199,15 @@ class SoundSystem {
     const now = this.ctx.currentTime;
     const t = Math.max(0.05, Math.min(1, throttle));
 
-    // Turbine pitch scales with throttle + airspeed
     const turbineFreq = 380 + t * 950 + (speedKmh / 2000) * 300;
     if (this.jetTurbineOsc1) this.jetTurbineOsc1.frequency.setTargetAtTime(turbineFreq, now, 0.1);
     if (this.jetTurbineOsc2) this.jetTurbineOsc2.frequency.setTargetAtTime(turbineFreq * 0.5, now, 0.1);
 
-    // Filter bandwidth opens with speed and thrust
     if (this.jetNoiseFilter) {
       const filterFreq = 600 + t * 2400 + (speedKmh / 2000) * 800;
       this.jetNoiseFilter.frequency.setTargetAtTime(filterFreq, now, 0.1);
     }
 
-    // Afterburner rumble
     if (this.jetAfterburnerGain) {
       const abTarget = afterburner ? 0.35 : 0;
       this.jetAfterburnerGain.gain.setTargetAtTime(abTarget, now, 0.08);
@@ -187,14 +217,12 @@ class SoundSystem {
   // --- HELICOPTER SOUNDS ---
   public startHelicopter() {
     this.init();
-    this.resume();
     if (!this.ctx || !this.engineGain || !this.noiseBuffer || this.heliActive) return;
     this.stopAllEngines();
 
     try {
       const now = this.ctx.currentTime;
 
-      // Turboshaft hum
       this.heliTurbineOsc = this.ctx.createOscillator();
       this.heliTurbineOsc.type = 'sawtooth';
       this.heliTurbineOsc.frequency.setValueAtTime(140, now);
@@ -203,7 +231,6 @@ class SoundSystem {
       this.heliTurbineOsc.connect(turbineGain);
       turbineGain.connect(this.engineGain);
 
-      // Chopping blade slap: LFO amplitude-modulating noise
       this.heliRotorNoise = this.ctx.createBufferSource();
       this.heliRotorNoise.buffer = this.noiseBuffer;
       this.heliRotorNoise.loop = true;
@@ -217,7 +244,7 @@ class SoundSystem {
 
       this.heliRotorLfo = this.ctx.createOscillator();
       this.heliRotorLfo.type = 'sawtooth';
-      this.heliRotorLfo.frequency.setValueAtTime(16, now); // 16 Hz blade chops
+      this.heliRotorLfo.frequency.setValueAtTime(16, now);
 
       const lfoGain = this.ctx.createGain();
       lfoGain.gain.setValueAtTime(0.25, now);
@@ -244,7 +271,6 @@ class SoundSystem {
     const rpm = Math.max(0.3, Math.min(1.2, rotorRpmPercent));
 
     if (this.heliRotorLfo) {
-      // Blade chop frequency: 12 - 20 Hz
       this.heliRotorLfo.frequency.setTargetAtTime(12 + rpm * 8 + collective * 4, now, 0.1);
     }
     if (this.heliTurbineOsc) {
@@ -259,24 +285,20 @@ class SoundSystem {
   // --- CAR SOUNDS ---
   public startCar() {
     this.init();
-    this.resume();
     if (!this.ctx || !this.engineGain || !this.noiseBuffer || this.carActive) return;
     this.stopAllEngines();
 
     try {
       const now = this.ctx.currentTime;
 
-      // Engine primary tone
       this.carOsc1 = this.ctx.createOscillator();
       this.carOsc1.type = 'sawtooth';
       this.carOsc1.frequency.setValueAtTime(55, now);
 
-      // Engine secondary harmonic
       this.carOsc2 = this.ctx.createOscillator();
       this.carOsc2.type = 'triangle';
       this.carOsc2.frequency.setValueAtTime(110, now);
 
-      // Deep exhaust bass
       this.carSubOsc = this.ctx.createOscillator();
       this.carSubOsc.type = 'sine';
       this.carSubOsc.frequency.setValueAtTime(45, now);
@@ -294,7 +316,6 @@ class SoundSystem {
       this.carFilter.connect(carGain);
       carGain.connect(this.engineGain);
 
-      // Tire screech synthesizer
       this.tireNoiseNode = this.ctx.createBufferSource();
       this.tireNoiseNode.buffer = this.noiseBuffer;
       this.tireNoiseNode.loop = true;
@@ -327,8 +348,7 @@ class SoundSystem {
     const now = this.ctx.currentTime;
     const normRpm = Math.max(800, Math.min(8500, rpm));
 
-    // Pitch proportional to engine RPM
-    const baseFreq = (normRpm / 60) * 2.5; // ~40Hz at idle, ~350Hz at redline
+    const baseFreq = (normRpm / 60) * 2.5;
     if (this.carOsc1) this.carOsc1.frequency.setTargetAtTime(baseFreq, now, 0.05);
     if (this.carOsc2) this.carOsc2.frequency.setTargetAtTime(baseFreq * 2.0, now, 0.05);
     if (this.carSubOsc) this.carSubOsc.frequency.setTargetAtTime(baseFreq * 0.75, now, 0.05);
@@ -338,7 +358,6 @@ class SoundSystem {
       this.carFilter.frequency.setTargetAtTime(openFreq, now, 0.06);
     }
 
-    // Tire squeal if drifting or braking hard
     if (this.tireSkidGain) {
       const skidIntensity = Math.min(1, Math.max(0, (driftSlip - 0.25) * 2.5));
       this.tireSkidGain.gain.setTargetAtTime(skidIntensity * 0.35, now, 0.05);
@@ -362,8 +381,14 @@ class SoundSystem {
       if (this.carSubOsc) { this.carSubOsc.stop(); this.carSubOsc.disconnect(); }
       if (this.tireNoiseNode) { this.tireNoiseNode.stop(); this.tireNoiseNode.disconnect(); }
     } catch (e) {
-      // Ignored
+      // Ignored — nodes may already be stopped
     }
+
+    // Null refs
+    this.jetTurbineOsc1 = null; this.jetTurbineOsc2 = null;
+    this.jetNoiseNode = null; this.jetAfterburnerOsc = null;
+    this.heliTurbineOsc = null; this.heliRotorNoise = null; this.heliRotorLfo = null;
+    this.carOsc1 = null; this.carOsc2 = null; this.carSubOsc = null; this.tireNoiseNode = null;
 
     this.jetActive = false;
     this.heliActive = false;
@@ -373,7 +398,6 @@ class SoundSystem {
   // --- UI SOUND EFFECTS ---
   public playClick() {
     this.init();
-    this.resume();
     if (!this.ctx || !this.fxGain) return;
     try {
       const osc = this.ctx.createOscillator();
@@ -393,15 +417,14 @@ class SoundSystem {
 
   public playCheckpointDing() {
     this.init();
-    this.resume();
     if (!this.ctx || !this.fxGain) return;
     try {
       const now = this.ctx.currentTime;
       const osc = this.ctx.createOscillator();
       const gain = this.ctx.createGain();
       osc.type = 'triangle';
-      osc.frequency.setValueAtTime(587.33, now); // D5
-      osc.frequency.setValueAtTime(880, now + 0.1); // A5
+      osc.frequency.setValueAtTime(587.33, now);
+      osc.frequency.setValueAtTime(880, now + 0.1);
       gain.gain.setValueAtTime(0.3, now);
       gain.gain.exponentialRampToValueAtTime(0.001, now + 0.6);
       osc.connect(gain);
@@ -413,11 +436,10 @@ class SoundSystem {
 
   public playMissionComplete() {
     this.init();
-    this.resume();
     if (!this.ctx || !this.fxGain) return;
     try {
       const now = this.ctx.currentTime;
-      const notes = [523.25, 659.25, 783.99, 1046.50]; // C5, E5, G5, C6 fanfare
+      const notes = [523.25, 659.25, 783.99, 1046.50];
       notes.forEach((freq, idx) => {
         const osc = this.ctx!.createOscillator();
         const gain = this.ctx!.createGain();
@@ -436,7 +458,6 @@ class SoundSystem {
 
   public playStallWarning() {
     this.init();
-    this.resume();
     if (!this.ctx || !this.fxGain) return;
     try {
       const now = this.ctx.currentTime;
@@ -455,7 +476,6 @@ class SoundSystem {
 
   public playCrash() {
     this.init();
-    this.resume();
     if (!this.ctx || !this.fxGain || !this.noiseBuffer) return;
     try {
       const now = this.ctx.currentTime;

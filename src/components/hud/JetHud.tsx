@@ -114,8 +114,11 @@ export const JetHud: React.FC<JetHudProps> = ({ telemetry, units, scale = 1 }) =
         </div>
 
         {/* Vertical Speed Indicator (VSI) */}
-        <div className="w-full">
+        <div className="w-full space-y-1">
           <div className="text-[10px] text-cyan-300">VSI: {telemetry.verticalSpeedMs > 0 ? '+' : ''}{Math.round(telemetry.verticalSpeedMs)} M/S</div>
+          <div className="text-[10px] text-amber-300">
+            AoA: {telemetry.aoaDeg !== undefined ? telemetry.aoaDeg.toFixed(1) : '—'}°
+          </div>
         </div>
       </div>
 
@@ -206,6 +209,18 @@ export const JetHud: React.FC<JetHudProps> = ({ telemetry, units, scale = 1 }) =
         <div className="px-3 py-1 border border-cyan-500/40 bg-cyan-950/40 text-cyan-300 text-xs">
           STAB: AUTO
         </div>
+
+        {/* Surface Type */}
+        {telemetry.surfaceType && (
+          <div className="px-3 py-1 border border-slate-700 bg-slate-900/60 text-slate-400 text-[10px] uppercase tracking-wider">
+            {telemetry.surfaceType}
+          </div>
+        )}
+      </div>
+
+      {/* Right-click hint */}
+      <div className="absolute bottom-2 right-4 text-[9px] text-slate-600 pointer-events-none">
+        RMB+DRAG to orbit camera
       </div>
     </div>
   );

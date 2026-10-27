@@ -17,6 +17,7 @@ import { MissionHud } from '../components/hud/MissionHud';
 import { Minimap } from '../components/hud/Minimap';
 import { soundSystem } from './audio/SoundSystem';
 import { PauseMenu } from '../components/menus/PauseMenu';
+import { DevTelemetryOverlay } from '../components/hud/DevTelemetry';
 
 export const GameCanvas: React.FC = () => {
   const currentVehicle = useGameStore(state => state.getCurrentVehicle());
@@ -43,7 +44,7 @@ export const GameCanvas: React.FC = () => {
     angularVelocity: new THREE.Vector3(),
     acceleration: new THREE.Vector3(),
     isGrounded: true,
-    throttle: currentVehicle.category === 'car' ? 0 : 0.45,
+    throttle: 0, // Always start at 0 throttle for jets; player must spool up
     steer: 0,
     pitchInput: 0,
     rollInput: 0,
@@ -65,6 +66,7 @@ export const GameCanvas: React.FC = () => {
   });
 
   // Sound Engine Setup & Cleanup
+  // NOTE: Audio is NOT stopped on pause — soundSystem.setPaused() ducks the volume instead.
   useEffect(() => {
     soundSystem.init();
     soundSystem.setVolumes(settings.masterVolume, settings.engineVolume, settings.fxVolume);
@@ -77,10 +79,16 @@ export const GameCanvas: React.FC = () => {
       soundSystem.startCar();
     }
 
+    // Cleanup only when the vehicle CATEGORY changes (not on pause)
     return () => {
       soundSystem.stopAllEngines();
     };
-  }, [currentVehicle.category]);
+  }, [currentVehicle.category]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Pause: duck audio without destroying it (fixes Escape audio bug)
+  useEffect(() => {
+    soundSystem.setPaused(isPaused);
+  }, [isPaused]);
 
   // Input Manager Attach
   useEffect(() => {
@@ -149,6 +157,7 @@ export const GameCanvas: React.FC = () => {
       }
 
       if (inputs.pause && keyCooldown.current.pause <= 0) {
+        // DO NOT call soundSystem.stopAllEngines() here — setPaused() handles audio
         setPaused(true);
         soundSystem.playClick();
         keyCooldown.current.pause = 0.4;
@@ -198,6 +207,11 @@ export const GameCanvas: React.FC = () => {
           throttlePercent: state.throttle * 100,
           rpmPercent: state.engineRpm,
           gear: state.currentGear,
+          aoaDeg: state.aoaDeg,
+          liftN: state.liftN,
+          dragN: state.dragN,
+          thrustN: state.thrustN,
+          surfaceType: state.surfaceType,
           headingDeg,
           pitchDeg,
           rollDeg,
@@ -233,6 +247,7 @@ export const GameCanvas: React.FC = () => {
           category={currentVehicle.category}
           cameraMode={cameraMode}
           baseFov={settings.fov}
+          sensitivity={settings.mouseSensitivity}
         />
 
         <World vehiclePosRef={vehiclePosRef} />
@@ -264,6 +279,9 @@ export const GameCanvas: React.FC = () => {
 
       {/* Minimap Navigation Radar */}
       <Minimap />
+
+      {/* Developer Telemetry Overlay */}
+      <DevTelemetryOverlay telemetry={telemetry} category={currentVehicle.category} />
 
       {/* HUD Quick Camera & Reset Controls */}
       <div className="absolute top-6 right-48 flex items-center space-x-2 pointer-events-auto">

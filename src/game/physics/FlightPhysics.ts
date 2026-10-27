@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { ControlInputs, VehiclePhysicsState } from '../../types/physics';
 import { VehicleDefinition } from '../../types/vehicle';
+import { collisionSystem } from './CollisionSystem';
 
 export class FlightPhysics {
   private def: VehicleDefinition;
@@ -9,8 +10,13 @@ export class FlightPhysics {
   private forward = new THREE.Vector3();
   private up = new THREE.Vector3();
   private right = new THREE.Vector3();
-  private liftDir = new THREE.Vector3();
+  private liftForce = new THREE.Vector3();
+  private dragForce = new THREE.Vector3();
+  private thrustForce = new THREE.Vector3();
+  private gravityForce = new THREE.Vector3();
+  private totalForce = new THREE.Vector3();
   private tempVec = new THREE.Vector3();
+  private invQuat = new THREE.Quaternion();
   private angularAcc = new THREE.Vector3();
 
   // Landing gear state
@@ -27,7 +33,7 @@ export class FlightPhysics {
     dt: number,
     assistEnabled: boolean = true
   ) {
-    dt = Math.min(0.04, Math.max(0.001, dt)); // Stable clamped timestep
+    dt = Math.min(0.04, Math.max(0.001, dt));
 
     // Toggle landing gear (G key)
     this.gearCooldown = Math.max(0, this.gearCooldown - dt);
@@ -43,9 +49,9 @@ export class FlightPhysics {
     this.right.set(1, 0, 0).applyQuaternion(state.quaternion);
 
     // Throttle & Afterburner Controls
-    // Also allow forward key (W) on runway to accelerate throttle
-    const throttleRate = 0.6;
-    if (inputs.throttleAxis > 0.1 || (state.isGrounded && inputs.forward)) {
+    // Support throttle axis (Shift/Ctrl) or pitch/forward on runway
+    const throttleRate = 0.7;
+    if (inputs.throttleAxis > 0.1 || (state.isGrounded && (inputs.pitchDown || inputs.forward))) {
       state.throttle = Math.min(1.0, state.throttle + throttleRate * dt);
     } else if (inputs.throttleAxis < -0.1) {
       state.throttle = Math.max(0.0, state.throttle - throttleRate * dt);
@@ -53,93 +59,107 @@ export class FlightPhysics {
 
     // Boost / Afterburner (Space)
     state.afterburner = inputs.boost;
-    if (state.afterburner && state.throttle < 0.9) {
-      state.throttle = Math.min(1.0, state.throttle + 1.2 * dt);
+    if (state.afterburner) {
+      state.throttle = Math.min(1.0, state.throttle + 1.5 * dt);
     }
 
-    // Velocity metrics
+    // Velocity & Airspeed metrics
     const speed = state.velocity.length();
     const speedKmh = speed * 3.6;
-    const forwardSpeed = state.velocity.dot(this.forward);
 
-    // Atmospheric dynamic pressure
-    const airDensity = 1.225 * Math.exp(-Math.max(0, state.position.y) / 8500);
+    // Atmospheric dynamic pressure (air density drops with altitude)
+    const altitude = Math.max(0, state.position.y);
+    const airDensity = 1.225 * Math.exp(-altitude / 8500);
     const dynamicPressure = 0.5 * airDensity * (speed * speed);
 
-    // Control authority: full authority once rolling > 60 km/h
-    const controlAuthority = Math.min(1.0, Math.max(0.2, speed / 40));
+    // Control authority: scales with dynamic pressure / airspeed
+    const controlAuthority = Math.min(1.2, Math.max(0.25, speed / 45));
 
-    // Calculate Angle of Attack (AoA)
-    let aoa = 0;
-    if (speed > 8) {
-      const velDir = this.tempVec.copy(state.velocity).normalize();
-      const dotFwd = Math.max(-1, Math.min(1, velDir.dot(this.forward)));
-      aoa = Math.acos(dotFwd);
-      // Positive AoA when aircraft nose is pitched up relative to velocity vector
-      if (velDir.dot(this.up) < 0) aoa = -aoa;
+    // Calculate local velocity for true Angle of Attack (AoA) and sideslip (Beta)
+    this.invQuat.copy(state.quaternion).invert();
+    const localVel = this.tempVec.copy(state.velocity).applyQuaternion(this.invQuat);
+    
+    // In local space: nose is -Z, roof is +Y, right wing is +X
+    // Angle of Attack (AoA): positive when airflow hits underside of wings
+    let aoaRad = 0;
+    if (speed > 5) {
+      aoaRad = Math.atan2(-localVel.y, -localVel.z);
     }
+    const aoaDeg = aoaRad * (180 / Math.PI);
+    state.aoaDeg = aoaDeg;
 
-    // Add wing incidence angle (camber gives lift even at 0 pitch)
-    const effectiveAoA = aoa + 0.05; // ~2.9 degrees incidence
+    // Stall calculation: critical AoA ~ 22 degrees
+    const stallAngleRad = 0.384; // ~22 degrees
+    const isStalling = Math.abs(aoaRad) > stallAngleRad || (speed < 24 && !state.isGrounded && altitude > 8);
+    state.stallRatio = isStalling ? Math.min(1.0, (Math.abs(aoaRad) - stallAngleRad) / 0.18 + 0.3) : 0;
 
-    // Stall calculation: stall when AoA > 26 degrees or speed < 70 km/h in mid-air
-    const stallAngleRad = 0.45; // ~26 degrees
-    const isStalling = Math.abs(aoa) > stallAngleRad || (speed < 20 && !state.isGrounded && state.position.y > 10);
-    state.stallRatio = isStalling ? Math.min(1.0, (Math.abs(aoa) - stallAngleRad) / 0.2 + 0.3) : 0;
-
-    // Aerodynamic Lift Coefficient: C_L curve
-    let liftCoeff = 3.6 * effectiveAoA;
-    if (Math.abs(aoa) > stallAngleRad) {
-      liftCoeff *= 0.35; // Post-stall decay
-    }
-    liftCoeff = Math.max(-1.5, Math.min(2.5, liftCoeff));
-
-    // Mass and Gravity
+    // Wing specifications
     const mass = this.def.specs.massKg;
-    const gravityForce = new THREE.Vector3(0, -9.81 * mass, 0);
+    const wingArea = this.def.specs.wingAreaM2 || 75;
 
-    // Aerodynamic Lift Force: Aligned with aircraft UP vector
-    // Calibrated so takeoff occurs smoothly around 160-180 km/h when pitching up
-    const wingArea = 72; // m^2
-    const liftScale = 0.72;
-    const liftMagnitude = dynamicPressure * wingArea * liftCoeff * liftScale;
-    this.liftDir.copy(this.up).multiplyScalar(liftMagnitude);
+    // Aerodynamic Lift Coefficient (CL)
+    // Small positive camber lift at AoA = 0
+    const cl0 = 0.08;
+    let cl = cl0 + 4.8 * aoaRad;
+    if (Math.abs(aoaRad) > stallAngleRad) {
+      cl = Math.sign(aoaRad) * (1.5 - (Math.abs(aoaRad) - stallAngleRad) * 2.2);
+    }
+    cl = Math.max(-1.4, Math.min(2.2, cl));
+
+    // Lift Force: acts along aircraft local UP vector
+    const liftScale = 0.95;
+    const liftMagnitude = dynamicPressure * wingArea * cl * liftScale;
+    this.liftForce.copy(this.up).multiplyScalar(liftMagnitude);
+    state.liftN = liftMagnitude;
+
+    // Aerodynamic Drag Coefficient (CD): Parasite + Induced + Gear Drag
+    const cd0 = 0.019;
+    const gearCd = state.landingGear ? 0.038 : 0.005;
+    const inducedCd = (cl * cl) / (Math.PI * 3.6);
+    const cd = cd0 + inducedCd + gearCd;
+    const dragMagnitude = dynamicPressure * wingArea * cd * 0.52;
+    if (speed > 0.1) {
+      this.dragForce.copy(state.velocity).normalize().multiplyScalar(-dragMagnitude);
+    } else {
+      this.dragForce.set(0, 0, 0);
+    }
+    state.dragN = dragMagnitude;
 
     // Engine Thrust Force
-    // F-22 has 2x 156 kN = 312 kN thrust (dry) and 450 kN with afterburner
-    const baseThrustKn = parseFloat(this.def.specs.powerHpOrKn) || 160;
-    let thrustN = state.throttle * baseThrustKn * 1200;
-    if (state.afterburner) thrustN *= 1.7; // Afterburner multiplier
+    // Uses dry thrust ratings (e.g. 312 kN for F-22) and afterburner boost (450 kN)
+    const dryKn = this.def.specs.thrustDryKn || 200;
+    const abKn = this.def.specs.thrustAfterburnerKn || (dryKn * 1.45);
+    const maxThrustN = (state.afterburner ? abKn : dryKn) * 1000;
+    const currentThrustN = state.throttle * maxThrustN;
+    this.thrustForce.copy(this.forward).multiplyScalar(currentThrustN);
+    state.thrustN = currentThrustN;
 
-    const thrustForce = this.tempVec.copy(this.forward).multiplyScalar(thrustN);
+    // Gravity Force
+    this.gravityForce.set(0, -9.81 * mass, 0);
 
-    // Aerodynamic Drag Force (Parasitic + Induced + Gear Drag)
-    const gearDrag = state.landingGear ? 0.04 : 0.01;
-    const inducedDrag = (liftCoeff * liftCoeff) / (Math.PI * 3.8);
-    const dragCoeff = 0.018 + inducedDrag + gearDrag;
-    const dragN = dynamicPressure * wingArea * dragCoeff * 0.45;
-    const dragForce = state.velocity.clone().normalize().multiplyScalar(-dragN);
-
-    // Total Net Aerodynamic Forces
-    const totalForce = new THREE.Vector3();
-    totalForce.add(thrustForce);
-    totalForce.add(this.liftDir);
-    totalForce.add(dragForce);
-    totalForce.add(gravityForce);
+    // Sum Total Aerodynamic & Propulsion Forces
+    this.totalForce.set(0, 0, 0);
+    this.totalForce.add(this.thrustForce);
+    this.totalForce.add(this.liftForce);
+    this.totalForce.add(this.dragForce);
+    this.totalForce.add(this.gravityForce);
 
     // Linear Acceleration
-    const linearAcc = totalForce.divideScalar(mass);
+    const linearAcc = this.totalForce.divideScalar(mass);
 
     // Angular Torques (Pitch, Roll, Yaw)
-    // Pulling stick back (inputs.pitchUp / S key) rotates nose UP
-    const pitchRate = (this.def.specs.handling / 50) * 2.2 * controlAuthority;
-    const rollRate = (this.def.specs.handling / 50) * 3.8 * controlAuthority;
-    const yawRate = (this.def.specs.handling / 50) * 1.2 * controlAuthority;
+    // S key (pitchUp) pulls stick back -> nose pitches UP (positive rotation around X axis)
+    // W key (pitchDown) pushes stick forward -> nose pitches DOWN (negative rotation around X axis)
+    const handling = this.def.specs.handling || 90;
+    const pitchRate = (handling / 50) * 2.4 * controlAuthority;
+    const rollRate = (handling / 50) * 3.8 * controlAuthority;
+    const yawRate = (handling / 50) * 1.3 * controlAuthority;
 
     this.angularAcc.set(0, 0, 0);
 
-    // Pitch: inputs.pitchAxis is negative for pitch up (S key)
-    this.angularAcc.x += inputs.pitchAxis * pitchRate;
+    // Invert pitch axis from input manager (pitchAxis is negative for pitchUp)
+    // We negate it so pitchUp creates POSITIVE torque -> nose rotates UP!
+    this.angularAcc.x += -inputs.pitchAxis * pitchRate;
     // Roll
     this.angularAcc.z += -inputs.rollAxis * rollRate;
     // Yaw
@@ -148,7 +168,7 @@ export class FlightPhysics {
     // Flight Stabilizer: auto-level wings when roll input is released
     if (assistEnabled && Math.abs(inputs.rollAxis) < 0.05 && speed > 25) {
       const bankAngle = Math.atan2(this.right.y, this.up.y);
-      this.angularAcc.z += bankAngle * 1.8;
+      this.angularAcc.z += bankAngle * 2.2;
     }
 
     // Angular damping
@@ -169,45 +189,53 @@ export class FlightPhysics {
     // Integrate linear velocity
     state.velocity.addScaledVector(linearAcc, dt);
 
-    // Ground Contact & Runway Interaction
-    const groundHeight = 2.0;
-    if (state.position.y <= groundHeight) {
-      state.position.y = groundHeight;
+    // Collision & Runway Interaction
+    const surface = collisionSystem.getSurfaceAt(state.position.x, state.position.z, state.position.y);
+    state.surfaceType = surface.surfaceType;
 
-      // Check if aircraft has enough upward lift/velocity to take off
-      const verticalForceNet = totalForce.y;
-      const isPitchingUp = this.forward.y > 0.03;
+    const gearClearance = 2.0;
+    const groundLevel = surface.elevation + gearClearance;
 
-      if (speedKmh > 130 && (isPitchingUp || verticalForceNet > 0)) {
-        // Takeoff transition: allow vertical climb!
+    if (state.position.y <= groundLevel) {
+      state.position.y = groundLevel;
+
+      // Check if aircraft has enough vertical climb or lift to become airborne
+      // Rotation takeoff: speed > 130 km/h and pulling stick back (pitching up) or net upward force
+      const isPitchingUp = this.forward.y > 0.015;
+      const verticalForceNet = this.totalForce.y;
+
+      if (speedKmh > 135 && (isPitchingUp || verticalForceNet > 0)) {
+        // Smooth liftoff!
         state.isGrounded = false;
         if (state.velocity.y < 2) {
-          state.velocity.y = Math.max(state.velocity.y, (speedKmh / 160) * 6.0);
+          state.velocity.y = Math.max(state.velocity.y, (speedKmh / 160) * 5.5 * Math.max(0.3, this.forward.y * 8));
         }
       } else {
-        // Firmly rolling on ground
+        // Firmly on ground: rolling down runway or taxiway
         state.isGrounded = true;
         if (state.velocity.y < 0) state.velocity.y = 0;
 
-        // Ground roll friction
-        let groundFriction = 0.996;
-        if (state.throttle < 0.1 || inputs.backward) {
-          groundFriction = 0.95; // Brakes
+        // Ground roll friction (low resistance on runway, higher with brakes or off-road)
+        let rollFriction = surface.friction;
+        if (inputs.backward || (state.throttle < 0.1 && inputs.pitchDown)) {
+          rollFriction = 0.94; // Wheel brakes applied
         }
-        state.velocity.x *= groundFriction;
-        state.velocity.z *= groundFriction;
+        state.velocity.x *= rollFriction;
+        state.velocity.z *= rollFriction;
 
-        // On ground, keep pitch bounded to realistic rotation angles (0 to 18 degrees)
+        // On ground, prevent nose from digging into asphalt
         if (this.forward.y < -0.01) {
-          // Prevent nose from digging into asphalt
-          state.angularVelocity.x *= 0.5;
+          state.angularVelocity.x *= 0.4;
         }
-        // Dampen roll on ground so wings stay level with runway
-        state.angularVelocity.z *= 0.6;
+        // Keep wings level with ground while wheels have contact
+        state.angularVelocity.z *= 0.55;
       }
     } else {
       state.isGrounded = false;
     }
+
+    // Resolve lateral building collision
+    collisionSystem.resolveBuildingCollision(state.position, state.velocity, 4.5);
 
     // Integrate position
     state.position.addScaledVector(state.velocity, dt);

@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { ControlInputs, VehiclePhysicsState } from '../../types/physics';
 import { VehicleDefinition } from '../../types/vehicle';
+import { collisionSystem } from './CollisionSystem';
 
 export class HelicopterPhysics {
   private def: VehicleDefinition;
@@ -26,7 +27,7 @@ export class HelicopterPhysics {
     dt: number,
     assistEnabled: boolean = true
   ) {
-    dt = Math.min(0.05, Math.max(0.001, dt));
+    dt = Math.min(0.04, Math.max(0.001, dt));
 
     // Toggle hover assist
     this.hoverAssistCooldown = Math.max(0, this.hoverAssistCooldown - dt);
@@ -41,7 +42,7 @@ export class HelicopterPhysics {
     this.right.set(1, 0, 0).applyQuaternion(state.quaternion);
 
     // Collective control (Thrust up/down along rotor shaft)
-    const collectiveRate = 0.4;
+    const collectiveRate = 0.45;
     if (inputs.throttleAxis > 0.1) {
       state.throttle = Math.min(1.0, state.throttle + collectiveRate * dt);
     } else if (inputs.throttleAxis < -0.1) {
@@ -55,25 +56,32 @@ export class HelicopterPhysics {
     const mass = this.def.specs.massKg;
     const gravityNewtons = mass * 9.81;
 
-    // Ground effect lift multiplier (cushion of air within 1 rotor diameter ~8m)
+    // Ground query for ground effect & landing
+    const surface = collisionSystem.getSurfaceAt(state.position.x, state.position.z, state.position.y);
+    state.surfaceType = surface.surfaceType;
+
+    const altitudeAboveSurface = Math.max(0, state.position.y - surface.elevation);
+
+    // Ground effect lift multiplier (cushion within 8m of surface)
     let groundEffect = 1.0;
-    if (state.position.y < 8.0) {
-      const h = Math.max(1.0, state.position.y);
-      groundEffect = 1.0 + 0.35 * (1.0 - (h / 8.0));
+    if (altitudeAboveSurface < 8.0) {
+      const h = Math.max(1.0, altitudeAboveSurface);
+      groundEffect = 1.0 + 0.35 * (1.0 - h / 8.0);
     }
 
-    // Collective rotor thrust: neutral collective (~0.5) generates exactly 1.0G hover thrust
-    // Max collective (1.0) gives 1.7G climb. Min collective (0.0) gives descent.
+    // Collective rotor thrust: ~0.48 collective equals 1.0G hover
     const hoverCollective = 0.48;
-    const maxThrust = gravityNewtons * 1.75;
-    const currentRotorThrust = (state.throttle / hoverCollective) * gravityNewtons * this.rotorRpmRatio * groundEffect;
+    const currentRotorThrust =
+      (state.throttle / hoverCollective) * gravityNewtons * this.rotorRpmRatio * groundEffect;
 
     const liftForce = this.tempVec.copy(this.rotorShaft).multiplyScalar(currentRotorThrust);
+    state.liftN = currentRotorThrust;
 
-    // Aerodynamic fuselage drag (opposes velocity vector)
+    // Aerodynamic fuselage drag
     const speed = state.velocity.length();
     const dragCoeff = 0.65;
     const dragForce = state.velocity.clone().multiplyScalar(-dragCoeff * speed * 25);
+    state.dragN = dragForce.length();
 
     // Total forces
     const totalForce = new THREE.Vector3();
@@ -92,7 +100,8 @@ export class HelicopterPhysics {
     this.angularAcc.set(0, 0, 0);
 
     // Cyclic Pitch: pushes nose down/up
-    this.angularAcc.x += inputs.pitchAxis * cyclicPitchSpeed;
+    // inputs.pitchAxis is negative for pitch up (S key)
+    this.angularAcc.x += -inputs.pitchAxis * cyclicPitchSpeed;
     // Cyclic Roll: banks left/right
     this.angularAcc.z += -inputs.rollAxis * cyclicRollSpeed;
     // Tail Rotor Anti-Torque Yaw
@@ -101,17 +110,16 @@ export class HelicopterPhysics {
     // Hover Assist / Auto-Stabilization
     const isHoverAssist = state.hoverAssist && assistEnabled;
     if (isHoverAssist) {
-      // Auto-level pitch and roll when controls are neutral
       if (Math.abs(inputs.pitchAxis) < 0.05) {
-        const pitchTilt = -this.forward.y;
-        this.angularAcc.x += pitchTilt * 3.5;
+        const pitchTilt = this.forward.y;
+        this.angularAcc.x -= pitchTilt * 3.5;
       }
       if (Math.abs(inputs.rollAxis) < 0.05) {
         const rollTilt = this.right.y;
         this.angularAcc.z += -rollTilt * 3.5;
       }
       // Auto vertical velocity dampener when collective is neutral
-      if (Math.abs(inputs.throttleAxis) < 0.1 && state.position.y > 3.0) {
+      if (Math.abs(inputs.throttleAxis) < 0.1 && altitudeAboveSurface > 2.0) {
         linearAcc.y -= state.velocity.y * 1.5;
       }
     }
@@ -132,27 +140,32 @@ export class HelicopterPhysics {
     localDelta.setFromEuler(rotEuler);
     state.quaternion.multiply(localDelta).normalize();
 
-    // Integrate Velocity & Position
+    // Integrate Velocity
     state.velocity.addScaledVector(linearAcc, dt);
 
     // Landing Skid Ground Contact
-    const skidGroundHeight = 1.8;
-    if (state.position.y <= skidGroundHeight) {
-      state.position.y = skidGroundHeight;
+    const skidHeight = 1.8;
+    const landingElevation = surface.elevation + skidHeight;
+
+    if (state.position.y <= landingElevation) {
+      state.position.y = landingElevation;
       state.isGrounded = true;
 
       if (state.velocity.y < 0) state.velocity.y = 0;
 
-      // Skid friction against ground
-      state.velocity.x *= 0.92;
-      state.velocity.z *= 0.92;
+      // Skid friction against surface
+      state.velocity.x *= 0.90;
+      state.velocity.z *= 0.90;
 
-      // Level out attitude on ground
-      state.angularVelocity.x *= 0.7;
-      state.angularVelocity.z *= 0.7;
+      // Level out attitude on landing pad
+      state.angularVelocity.x *= 0.65;
+      state.angularVelocity.z *= 0.65;
     } else {
       state.isGrounded = false;
     }
+
+    // Building wall collision prevention
+    collisionSystem.resolveBuildingCollision(state.position, state.velocity, 3.8);
 
     state.position.addScaledVector(state.velocity, dt);
 

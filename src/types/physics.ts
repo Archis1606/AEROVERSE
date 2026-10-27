@@ -26,6 +26,11 @@ export interface VehiclePhysicsState {
   verticalSpeed: number;
   gForce: number;
   stallRatio: number; // 0 = normal, 1 = full stall
+  aoaDeg?: number;
+  liftN?: number;
+  dragN?: number;
+  thrustN?: number;
+  surfaceType?: string;
 }
 
 export interface ControlInputs {

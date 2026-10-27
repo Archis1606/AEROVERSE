@@ -15,6 +15,9 @@ export const VEHICLE_CATALOG: VehicleDefinition[] = [
       handling: 94,
       massKg: 19700,
       powerHpOrKn: '2x 156 kN Thrust',
+      thrustDryKn: 312,
+      thrustAfterburnerKn: 450,
+      wingAreaM2: 78,
       flightCeilingM: 20000,
       description: '5th-generation stealth air superiority fighter with thrust vectoring, supercruise capability, and unmatched pitch agility.'
     },
@@ -40,6 +43,9 @@ export const VEHICLE_CATALOG: VehicleDefinition[] = [
       handling: 86,
       massKg: 13200,
       powerHpOrKn: '1x 191 kN Thrust',
+      thrustDryKn: 125,
+      thrustAfterburnerKn: 191,
+      wingAreaM2: 43,
       flightCeilingM: 15200,
       description: 'All-weather stealth combat aircraft engineered for precision sensor fusion and high internal payload capacity.'
     },
@@ -65,6 +71,9 @@ export const VEHICLE_CATALOG: VehicleDefinition[] = [
       handling: 99,
       massKg: 18500,
       powerHpOrKn: '2x 176 kN Thrust',
+      thrustDryKn: 216,
+      thrustAfterburnerKn: 352,
+      wingAreaM2: 78,
       flightCeilingM: 20000,
       description: 'Heavy tactical fighter capable of extreme post-stall angles of attack and Pugachev Cobra maneuvers.'
     },
@@ -89,7 +98,10 @@ export const VEHICLE_CATALOG: VehicleDefinition[] = [
       acceleration: 99,
       handling: 78,
       massKg: 28000,
-      powerHpOrKn: 'Pulse Detonation Hybrid',
+      powerHpOrKn: 'Pulse Detonation Hybrid (600 kN)',
+      thrustDryKn: 380,
+      thrustAfterburnerKn: 650,
+      wingAreaM2: 95,
       flightCeilingM: 30000,
       description: 'Black-project delta-wing atmospheric research platform with scramjet propulsion and extreme edge-of-space velocity.'
     },

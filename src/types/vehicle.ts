@@ -19,6 +19,9 @@ export interface VehicleSpecs {
   powerHpOrKn: string;
   flightCeilingM?: number;
   description: string;
+  thrustDryKn?: number;
+  thrustAfterburnerKn?: number;
+  wingAreaM2?: number;
 }
 
 export interface VehicleDefinition {
@@ -57,4 +60,9 @@ export interface VehicleTelemetry {
   isStalling: boolean;
   damagePercent: number;
   engineRpm: number;
+  aoaDeg?: number;
+  liftN?: number;
+  dragN?: number;
+  thrustN?: number;
+  surfaceType?: string;
 }
